@@ -88,8 +88,12 @@ LDSCRIPTS=${LDSCRIPTS:-$CSW/lvx-newlib/libgloss/lvx-mbr/linker_scripts}
 case "$TYPE" in
     float)  tmacro=DATA_TYPE_IS_FLOAT  ;;
     double) tmacro=DATA_TYPE_IS_DOUBLE ;;
-    int)    tmacro=DATA_TYPE_IS_INT    ;;
-    *) echo "TYPE must be float, double or int (got $TYPE)" >&2; exit 2 ;;
+    int)    echo "TYPE=int does not build: PolyBench defines SCALAR_VAL only under" >&2
+            echo "  DATA_TYPE_IS_FLOAT and DATA_TYPE_IS_DOUBLE, and every kernel that" >&2
+            echo "  uses it fails to compile with -DDATA_TYPE_IS_INT.  Measured" >&2
+            echo "  2026-10-09: 0 of 30 kernels build.  Upstream limitation, not LVX." >&2
+            exit 2 ;;
+    *) echo "TYPE must be float or double (got $TYPE)" >&2; exit 2 ;;
 esac
 
 # -T lvx-sim.ld supplies sbrk's _heap_start/_heap_end; without it a hosted link

@@ -76,8 +76,8 @@ mismatches** — so every number below is a believable one.
 ```
 
 **Nothing in PolyBench is vectorized to any useful degree.** The best kernel is
-`durbin` at 1.22×; two are *slower* in float than double (`jacobi-1d` 0.82×,
-`trisolv` 0.99×); the rest sit at 1.00–1.09×. Comparing the two cores says the
+`durbin` at 1.22×, then `nussinov` 1.09× and `adi` 1.07×; the rest sit at
+1.00–1.02×, and `trisolv` at 0.99× is the only one below parity. Comparing the two cores says the
 same thing from the other side: on double, **not one kernel moves more than 2%**
 between lvx-1 and lvx-2, and on float only `durbin` (−11.1%) and `gemm` (−1.4%)
 do.
@@ -109,6 +109,14 @@ instead of one, with a per-kernel baseline to track against.
 The seven kernels that emit no SIMD at all (`fdtd-2d`, `floyd-warshall`,
 `gesummv`, `gramschmidt`, `heat-3d`, `jacobi-1d`, `jacobi-2d`) are a separate,
 more basic list — identical code on both cores.
+
+`jacobi-1d` used to read 0.82× — FP32 *slower* than FP64 — and that was a bug
+in the benchmark, not a result: it wrote its stencil coefficient as a bare
+`0.33333`, which is a `double` in C, so the FP32 build widened to f64,
+multiplied, and narrowed back. Fixed to `SCALAR_VAL(0.33333)` (`GAPS.md` §7);
+10,311 against 10,312, and 2,241 cycles of its 12,552 had been conversions. It
+is the only kernel in the suite with a bare FP literal inside `#pragma scop`,
+and the printed output never changed, so only the cycle count could reveal it.
 
 See `harness/README.md` for what bounds these numbers: `MINI` trip counts are
 small, and the atomic CPU charges one cycle per bundle rather than modelling

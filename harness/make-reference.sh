@@ -58,8 +58,12 @@ CC=${CC:-gcc}
 case "$TYPE" in
     float)  tmacro=DATA_TYPE_IS_FLOAT  ;;
     double) tmacro=DATA_TYPE_IS_DOUBLE ;;
-    int)    tmacro=DATA_TYPE_IS_INT    ;;
-    *) echo "TYPE must be float, double or int (got $TYPE)" >&2; exit 2 ;;
+    int)    echo "TYPE=int does not build: PolyBench defines SCALAR_VAL only under" >&2
+            echo "  DATA_TYPE_IS_FLOAT and DATA_TYPE_IS_DOUBLE, and every kernel that" >&2
+            echo "  uses it fails to compile with -DDATA_TYPE_IS_INT.  Measured" >&2
+            echo "  2026-10-09: 0 of 30 kernels build.  Upstream limitation, not LVX." >&2
+            exit 2 ;;
+    *) echo "TYPE must be float or double (got $TYPE)" >&2; exit 2 ;;
 esac
 
 outdir="$repo/reference-output/$(echo "$DATASET" | tr A-Z a-z)-$TYPE"
@@ -85,6 +89,15 @@ while read -r path; do
     n=$((n+1))
 done < "$repo/utilities/benchmark_list"
 
-( cd "$outdir" && sha256sum ./*.txt > CHECKSUMS.txt )
+# CHECKSUMS.txt must be excluded from its own glob.  `sha256sum ./*.txt >
+# CHECKSUMS.txt' looks right and is not: on a REGENERATION the file already
+# exists, so the glob picks it up, and `>' truncates it before sha256sum gets
+# there -- so it records a hash of whatever it happened to read, which is racy
+# and self-referential.  Caught on 2026-10-09 when the jacobi-1d fix made the
+# only diff in reference-output/ a 31st CHECKSUMS.txt line.  Written to a temp
+# and moved, so the glob never sees the target.
+( cd "$outdir" \
+  && sha256sum $(ls *.txt | grep -vx CHECKSUMS.txt) > .checksums.tmp \
+  && mv .checksums.tmp CHECKSUMS.txt )
 echo
 echo "wrote $n references to $outdir  (buildfail: $bad)"

@@ -25,6 +25,8 @@ newlib, gem5 or the compiler.
 | 4 | `%Ld` is a glibc extension | `%llu` | the measurement line is **empty** |
 | 5 | `POLYBENCH_CYCLE_ACCURATE_TIMER` alone prints nothing | it now implies the timer | **no output, no error** |
 | 6 | the dump goes to `stderr`, which gem5 shares | `stdout` on LVX | corrupted dump, unfilterable |
+| 7 | `jacobi-1d` computes its FP32 kernel in FP64 | `SCALAR_VAL` | a **21.7% phantom FP32 slowdown** |
+| 8 | `TYPE=int` builds 0 of 30 kernels | harness rejects it | 30 `buildfail` rows |
 
 Gaps 4, 5 and 6 are the dangerous ones. None produces an error message, and
 each looks like a broken port or a broken benchmark rather than a missing
@@ -147,6 +149,55 @@ The cost is that a dump and a timing print now share a stream. That was never a
 combination to use: the dump's `printf` traffic dwarfs the kernel, so a dumped
 run's cycle count measures `printf`. The harness builds and runs the two
 separately.
+
+## 7. `jacobi-1d` computed its FP32 kernel in FP64 — fixed
+
+Not an LVX gap at all, but it corrupted an LVX measurement, so it belongs here.
+
+`jacobi-1d.c` wrote its stencil coefficient as a bare literal:
+
+```c
+B[i] = 0.33333 * (A[i-1] + A[i] + A[i + 1]);          /* jacobi-1d */
+B[i][j] = SCALAR_VAL(0.2) * (...);                    /* jacobi-2d, correct */
+```
+
+In C a bare `0.33333` is a **`double`**, so under `-DDATA_TYPE_IS_FLOAT` the
+f32 sum was widened, multiplied in f64 and narrowed back — `3 fwidenwd`,
+`2 fmuld`, `2 fnarrowdw` in the generated code. The kernel's FP32 number was
+therefore not an FP32 measurement, and it cost **2,241 cycles of 12,552 —
+21.7%** in conversions alone:
+
+| | FP32 | FP64 | ratio |
+|---|---|---|---|
+| before | 12,552 | 10,312 | **0.82×** (FP32 *slower*) |
+| after | 10,311 | 10,312 | **1.00×** |
+
+`SCALAR_VAL(0.33333)` fixes it, and the printed result does not change — at
+`%0.2f` the two roundings agree, which is exactly why no correctness check
+caught it and why only the cycle count gave it away.
+
+**It is the only kernel with this defect.** Checked all 30 for a bare FP
+literal inside `#pragma scop`: `jacobi-1d` was the one. (`ludcmp` has one too,
+in `init_array`, outside the timed region, so its figure was always valid;
+`deriche`'s `-2.0` is already inside `SCALAR_VAL`.) 12 of 30 kernels contain a
+bare literal *somewhere*, so the inconsistency is upstream-wide — it only
+matters when it lands in the timed loop.
+
+**The check that works, and two that do not.** Counting `fwiden` over the whole
+assembly flags all 30, because `print_array`'s `fprintf` widens `float` to
+`double` under C's default argument promotions. Scoping to the `kernel_*`
+symbol flags none — the kernels are `static` and `-O2` inlines them into
+`main`, so the symbol does not exist and the extraction silently yields
+nothing. What discriminates is **`fnarrow*` or an f64 arithmetic op**:
+`print_array` can only produce a widen, never either of those.
+
+## 8. `TYPE=int` does not build, upstream
+
+`polybench.h`'s per-kernel headers define `SCALAR_VAL` only under
+`DATA_TYPE_IS_FLOAT` and `DATA_TYPE_IS_DOUBLE`. Every kernel that uses it
+therefore fails to compile with `-DDATA_TYPE_IS_INT` — measured, **0 of 30
+build**. The harness now rejects `TYPE=int` with that explanation rather than
+emitting 30 `buildfail` rows.
 
 ## What is *not* a gap
 
