@@ -63,12 +63,52 @@ instrument for tracking a compiler than real hardware. Six metrics per kernel:
 | `kernel_cycles` | guest `$frcc` delta | **the headline** — the kernel alone |
 | `prog_cycles` | gem5 `system.cpu.numCycles` | whole program; the cross-check |
 | `bundles_dyn` | gem5 `simInsts` | gem5 counts one **bundle** as one "instruction" on this VLIW, so `prog_cycles / bundles_dyn` is execution-weighted packing density — what scheduling and bundling changes move |
-| `text_bytes` | `lvx-mbr-size` | code size |
-| `insns_static` | `objdump -d` | instruction count |
-| `bundles_static` | `;;` count in the disassembly | static packing |
+| `text_bytes` | `lvx-mbr-size` | whole-image code size |
+| `insns_static` | `objdump -d` on the ELF | whole-image instruction count |
+| `bundles_static` | `;;` count in the disassembly | whole-image static packing |
+| `kernel_insns` | `objdump -d` on the kernel's own `.o` | the kernel's instruction count |
+| `simd_insns` | lane-shape suffixes in that `.o` | **did the vectorizer fire** |
+| `scalar_fma` | `ffma*`/`fmul*` in that `.o` | did it fire on the loop that matters |
 
-The static three cost nothing and are defined even for a kernel the ISS cannot
+The static ones cost nothing and are defined even for a kernel the ISS cannot
 finish, so a code-size or packing regression is caught for all 30 regardless.
+
+### Why `simd_insns` is scoped to the kernel's own object
+
+A lane-wise mnemonic ends in its lane shape — `dp` = 2×64, `wq` = 4×32,
+`ho` = 8×16, `bx` = 16×8, all of them 128 bits (the letter is the lane *count*,
+not the width). Counting those over the linked ELF reported **6 SIMD
+instructions for `bicg` on lvx-1**, a core that has no lane-wise arithmetic at
+all. They were newlib's and libgcc's: lvx-1's data-movement family (`splatwq`,
+`evenwq`, `oddwq`, …) carries the same suffixes, and libgcc's vector helpers get
+linked in regardless. So these three are counted on the kernel translation unit
+alone — which is also the right scope, since `utilities/polybench.c` is
+instrumentation rather than kernel.
+
+### Why `simd_insns` and `scalar_fma` belong next to a cycle count
+
+Because together they distinguish *two different failures that look identical in
+cycles*. At `MINI`, `-O2`, float:
+
+| kernel | core | kernel_cycles | kernel_insns | simd | scalar_fma |
+|---|---|---|---|---|---|
+| `gemm` | lvx-1 | 110,856 | 195 | 0 | 3 |
+| `gemm` | lvx-2 | 109,316 | 298 | 29 | 3 |
+| `bicg` | lvx-1 | 17,957 | 209 | 0 | 2 |
+| `bicg` | lvx-2 | 17,954 | 286 | 10 | 2 |
+| `jacobi-2d` | lvx-1 | 416,815 | 168 | 0 | 4 |
+| `jacobi-2d` | lvx-2 | 416,815 | 168 | 0 | 4 |
+
+`jacobi-2d` is not vectorized at all — identical code on both cores. `gemm` and
+`bicg` *are*: lvx-2 emits 29 and 10 lane-wise instructions and about 50% more
+instructions overall. And they gain 1.4% and 0.02%.
+
+`scalar_fma` says why: **it does not change.** The scalar multiply-accumulate is
+still there on lvx-2, so the vector code is *additional* — the vectorizer took
+the easy elementwise loop (`C[i][j] *= beta` in gemm's case) and left the
+reduction nest that is the actual kernel alone. A cycle count alone cannot tell
+that apart from "the vectorizer never ran", and the two call for completely
+different work.
 
 **Caveat on what a cycle means.** The default `LVX_CPU=atomic` charges one cycle
 per bundle and models no memory latency, so these are really bundle counts — the

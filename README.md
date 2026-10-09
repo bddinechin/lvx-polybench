@@ -66,23 +66,50 @@ filling, ~1× means the kernel is effectively scalar.**
 
 ## The first result
 
-`results/lvx-2-O2-mini-{float,double}.tsv`, 2026-10-09, `-O2`, `MINI`, atomic
-CPU. 29 of 30 kernels `ok` or `fp-N`, one `fp-contract`, no mismatches — and:
+`results/lvx-{1,2}-O2-mini-{float,double}.tsv`, 2026-10-09, `-O2`, `MINI`,
+atomic CPU. All four sweeps: 22 kernels `ok`, 7 `fp-N`, 1 `fp-contract`, **no
+mismatches** — so every number below is a believable one.
 
 ```
-30 kernels compared, mean speedup 1.01x
+30 kernels compared, mean float/double speedup 1.01x
 >=1.6x (lanes filling): 0    <=1.15x (effectively scalar): 29
 ```
 
-**Nothing in PolyBench is being vectorized to any useful degree.** The best
-kernel is `durbin` at 1.22×, two are *slower* in float than in double
-(`jacobi-1d` 0.82×, `trisolv` 0.99×), and the rest sit at 1.00–1.09×. The
-`gemm` figures bear this out directly: of its two loops only `C[i][j] *= beta`
-vectorizes, while the multiply-accumulate that is the actual kernel stays scalar
-`ffmaw`/`fmulw`.
+**Nothing in PolyBench is vectorized to any useful degree.** The best kernel is
+`durbin` at 1.22×; two are *slower* in float than double (`jacobi-1d` 0.82×,
+`trisolv` 0.99×); the rest sit at 1.00–1.09×. Comparing the two cores says the
+same thing from the other side: on double, **not one kernel moves more than 2%**
+between lvx-1 and lvx-2, and on float only `durbin` (−11.1%) and `gemm` (−1.4%)
+do.
 
-See `harness/README.md` for the caveats that bound this — `MINI` trip counts are
+### But it is not that the vectorizer never runs
+
+That is the finding the `simd_insns`/`scalar_fma` columns exist to make, and it
+is the opposite of what the cycle counts alone suggest:
+
+| | lvx-2, float, MINI |
+|---|---|
+| kernels emitting lane-wise SIMD | **23 of 30** |
+| of those, kernels where the scalar FMA count is **unchanged** | **21 of 23** |
+| of those, kernels gaining more than 2% | **1** (`durbin`) |
+
+The vectorizer fires on most of the suite and grows the kernel by 30–60%
+(`3mm` 289 → 470 instructions, `gemm` 195 → 298) — and the scalar
+multiply-accumulate it was supposed to replace is **still there**. The vector
+code is *additional*: it takes the easy elementwise loop and leaves the
+reduction nest that is the actual kernel alone. `gemm` is the clearest case —
+of its two loops only `C[i][j] *= beta` vectorizes, while the
+multiply-accumulate stays scalar `ffmaw`/`fmulw`.
+
+So the gap is not "turn the vectorizer on". It is reduction and
+multiply-accumulate loop nests specifically, which is where
+`lvx-gcc-while-ult-plan` is already aimed — now measured across 30 kernels
+instead of one, with a per-kernel baseline to track against.
+
+The seven kernels that emit no SIMD at all (`fdtd-2d`, `floyd-warshall`,
+`gesummv`, `gramschmidt`, `heat-3d`, `jacobi-1d`, `jacobi-2d`) are a separate,
+more basic list — identical code on both cores.
+
+See `harness/README.md` for what bounds these numbers: `MINI` trip counts are
 small, and the atomic CPU charges one cycle per bundle rather than modelling
-memory — but the conclusion is not a measurement artefact: it is the same gap
-the `lvx-gcc-while-ult-plan` work is aimed at, measured across 30 kernels
-instead of one.
+memory. Neither affects the instruction-count evidence above.

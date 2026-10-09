@@ -117,7 +117,7 @@ outdir="$repo/results"; mkdir -p "$outdir"
 tsv="$outdir/$ARCH-O$OPT-$(echo "$DATASET" | tr A-Z a-z)-$TYPE.tsv"
 work=$(mktemp -d); trap 'rm -rf "$work"' 0 1 2 3 15
 
-HEADER='kernel\tarch\topt\tdataset\ttype\tcorrect\tkernel_cycles\tprog_cycles\tbundles_dyn\ttext_bytes\tinsns_static\tbundles_static'
+HEADER='kernel\tarch\topt\tdataset\ttype\tcorrect\tkernel_cycles\tprog_cycles\tbundles_dyn\ttext_bytes\tinsns_static\tbundles_static\tkernel_insns\tsimd_insns\tscalar_fma'
 
 # Rows are collected here and merged into $tsv at the end.  Writing $tsv
 # directly would make an ONLY= run DESTROY a full baseline, since the path
@@ -126,8 +126,8 @@ HEADER='kernel\tarch\topt\tdataset\ttype\tcorrect\tkernel_cycles\tprog_cycles\tb
 # cost a complete 13-row baseline.  Merging makes the re-run do the useful
 # thing -- replace that kernel's row, keep the rest.
 rows="$work/rows.tsv"; : > "$rows"
-printf '%-16s %-10s %14s %14s %12s %8s\n' \
-       KERNEL CORRECT KERNEL_CYC PROG_CYC TEXT INSNS
+printf '%-16s %-10s %14s %14s %10s %8s %6s %6s\n' \
+       KERNEL CORRECT KERNEL_CYC PROG_CYC TEXT KINSNS SIMD SFMA
 
 while read -r path; do
     case "$path" in ''|\#*) continue ;; esac
@@ -136,15 +136,17 @@ while read -r path; do
     [ -n "$ONLY" ] && ! grep -qw "$name" <<<"$ONLY" && continue
 
     bdir="$work/$name"; mkdir -p "$bdir"
-    row() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    row() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$name" "$ARCH" "$OPT" "$DATASET" "$TYPE" "$1" \
-            "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" >> "$rows"; }
+            "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" \
+            "${8:-}" "${9:-}" "${10:-}" >> "$rows"; }
 
     # --- the timed build: computation alive, print_array behind DCE_ONLY_CODE
     if ! $GCC $CFLAGS -I"$repo/$dir" "$repo/utilities/polybench.c" "$repo/$path" \
          $DEFS -DPOLYBENCH_CYCLE_ACCURATE_TIMER $LDFLAGS -o "$bdir/t.elf" -lm \
          > "$bdir/build-t.log" 2>&1; then
-        printf '%-16s %-10s %14s %14s %12s %8s\n' "$name" BUILDFAIL - - - -
+        printf '%-16s %-10s %14s %14s %10s %8s %6s %6s\n' \
+               "$name" BUILDFAIL - - - - - -
         row buildfail; continue
     fi
 
@@ -153,10 +155,38 @@ while read -r path; do
     $OBJDUMP -d "$bdir/t.elf" > "$bdir/dis.txt" 2>/dev/null
     insns=$(grep -cE '^\s+[0-9a-f]+:' "$bdir/dis.txt")
     sbundles=$(grep -c ';;' "$bdir/dis.txt")
+    # Lane-wise SIMD instructions, counted by their lane-shape suffix: dp=2x64,
+    # wq=4x32, ho=8x16, bx=16x8, all of them 128 bits (the letter is the lane
+    # COUNT, not the width).  This is the metric that says whether the
+    # vectorizer fired at all, and it is why it is worth having next to a cycle
+    # count: at MINI, lvx-2 emits 26 SIMD instructions for gemm against lvx-1's
+    # zero, carries 14% more text -- and runs 1.4% faster, because its scalar
+    # ffmaw count is UNCHANGED.  The vectorizer took the elementwise
+    # `C[i][j] *= beta' loop and left the multiply-accumulate nest that is the
+    # actual kernel alone, so the vector code is additional rather than a
+    # replacement.  A cycle count alone cannot distinguish that from "the
+    # vectorizer never ran"; this column can.
+    #
+    # SCOPED TO THE KERNEL'S OWN OBJECT, not the linked image.  Counting over
+    # the ELF reported 6 SIMD instructions for bicg on lvx-1 -- a core that has
+    # no lane-wise arithmetic at all.  They were newlib's and libgcc's: the
+    # lvx-1 data-movement family (splatwq, evenwq, oddwq, ...) carries the same
+    # lane-shape suffixes, and libgcc's own vector helpers get linked in.  A
+    # metric meant to say "did the vectorizer touch this kernel" cannot be read
+    # off an image that is mostly library code, so it is counted on the kernel
+    # translation unit alone -- also the right scope, since
+    # utilities/polybench.c is instrumentation rather than kernel.
+    $GCC $CFLAGS -I"$repo/$dir" $DEFS -DPOLYBENCH_CYCLE_ACCURATE_TIMER \
+         -c "$repo/$path" -o "$bdir/k.o" > /dev/null 2>&1
+    $OBJDUMP -d "$bdir/k.o" > "$bdir/kdis.txt" 2>/dev/null
+    kinsns=$(grep -cE '^\s+[0-9a-f]+:' "$bdir/kdis.txt")
+    simd=$(grep -coE '\b[a-z]+(dp|wq|ho|bx)\b' "$bdir/kdis.txt" || true)
+    sfma=$(grep -coE '\b(ffmaw|ffmad|fmulw|fmuld|ffmsw|ffmsd)\b' "$bdir/kdis.txt" || true)
 
     if [ "$STATIC_ONLY" = 1 ]; then
-        printf '%-16s %-10s %14s %14s %12s %8s\n' "$name" static - - "$text" "$insns"
-        row static '' '' '' "$text" "$insns" "$sbundles"; continue
+        printf '%-16s %-10s %14s %14s %10s %8s %6s %6s\n' \
+               "$name" static - - "$text" "$kinsns" "$simd" "$sfma"
+        row static '' '' '' "$text" "$insns" "$sbundles" "$kinsns" "$simd" "$sfma"; continue
     fi
 
     # --- the dumping build, for the correctness gate
@@ -254,9 +284,10 @@ while read -r path; do
         fi
     fi
 
-    printf '%-16s %-10s %14s %14s %12s %8s\n' \
-           "$name" "$correct" "${kcyc:-?}" "${pcyc:-?}" "$text" "$insns"
-    row "$correct" "${kcyc:-}" "${pcyc:-}" "${dynb:-}" "$text" "$insns" "$sbundles"
+    printf '%-16s %-10s %14s %14s %10s %8s %6s %6s\n' \
+           "$name" "$correct" "${kcyc:-?}" "${pcyc:-?}" "$text" "$kinsns" \
+           "$simd" "$sfma"
+    row "$correct" "${kcyc:-}" "${pcyc:-}" "${dynb:-}" "$text" "$insns" "$sbundles" "$kinsns" "$simd" "$sfma"
 done < "$repo/utilities/benchmark_list"
 
 # Merge: this run's rows win, rows for kernels it did not run are kept, and the
