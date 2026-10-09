@@ -161,7 +161,25 @@
 #  define POLYBENCH_DCE_ONLY_CODE
 # endif
 
-#define POLYBENCH_DUMP_TARGET stderr
+/* Upstream dumps to stderr so that a timed run can be piped without the dump
+   polluting the measurement.  On LVX stderr is the one stream that cannot be
+   trusted: the guest's fd 2 and gem5's own diagnostics land in it together, and
+   gem5 emits some of them *mid-run* (`Increasing stack size by one page'), so
+   they interleave inside the dump -- which prints a whole array as values
+   separated by spaces, with no newline until POLYBENCH_DUMP_END.  A line-prefix
+   filter cannot recover that, because the intrusion is not at a line boundary.
+   stdout carries only gem5's banner and the guest's bytes, so the dump goes
+   there and is cut out positionally (harness/guest-output.py).
+
+   The cost is that a dump and a timing print now share a stream.  That was
+   never a combination to use anyway: the dump's printf traffic dwarfs the
+   kernel, so a dumped run's cycle count measures printf.  The harness builds
+   the two separately and the correctness and timing runs are distinct.  */
+#if defined(__lvx__)
+# define POLYBENCH_DUMP_TARGET stdout
+#else
+# define POLYBENCH_DUMP_TARGET stderr
+#endif
 #define POLYBENCH_DUMP_START    fprintf(POLYBENCH_DUMP_TARGET, "==BEGIN DUMP_ARRAYS==\n")
 #define POLYBENCH_DUMP_FINISH   fprintf(POLYBENCH_DUMP_TARGET, "==END   DUMP_ARRAYS==\n")
 #define POLYBENCH_DUMP_BEGIN(s) fprintf(POLYBENCH_DUMP_TARGET, "begin dump: %s", s)
@@ -205,7 +223,15 @@ extern const unsigned int polybench_papi_eventlist[];
 
 
 /* Timing support. */
-# if defined(POLYBENCH_TIME) || defined(POLYBENCH_GFLOPS)
+/* POLYBENCH_CYCLE_ACCURATE_TIMER is not in this list upstream, which makes it
+   a trap: on its own it only *selects* rdtsc over gettimeofday inside
+   polybench_timer_{start,stop}, leaving polybench_print_instruments defined as
+   nothing.  The timer then runs correctly and the program prints no number at
+   all, which reads as a broken port rather than a missing -DPOLYBENCH_TIME.
+   Defining it is only ever meant to choose the cycle counter, so let it imply
+   the timer the way POLYBENCH_TIME does.  */
+# if defined(POLYBENCH_TIME) || defined(POLYBENCH_GFLOPS) \
+     || defined(POLYBENCH_CYCLE_ACCURATE_TIMER)
 #  undef polybench_start_instruments
 #  undef polybench_stop_instruments
 #  undef polybench_print_instruments

@@ -12,6 +12,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#if defined(__lvx__)
+# include <malloc.h>	/* memalign; see xmalloc below */
+#endif
 #include <unistd.h>
 #include <assert.h>
 #include <time.h>
@@ -39,6 +42,20 @@
 /* Total LLC cache size. By default 32+MB.. */
 #ifndef POLYBENCH_CACHE_SIZE_KB
 # define POLYBENCH_CACHE_SIZE_KB 32770
+#endif
+
+/* On LVX the cache flush is both impossible and meaningless, so it is off by
+   default.  polybench_flush_cache() calloc's POLYBENCH_CACHE_SIZE_KB (32770 KB,
+   ~33 MB) and walks it; that allocation fails on the ISS heap, its result is
+   never checked, and the walk dereferences NULL.  gem5 reports that as
+   `fatal: readBlob(0, ...) failed', which names neither the allocation nor the
+   benchmark -- and it fires only once POLYBENCH_TIME is defined, because the
+   flush hangs off polybench_prepare_instruments().  Nor is there anything to
+   flush: the default atomic CPU models no cache at all and the pipeline model's
+   L1s are 32 KB, so walking 33 MB would measure nothing either way.  Define
+   POLYBENCH_FLUSH_CACHE to force it back on.  */
+#if defined(__lvx__) && !defined(POLYBENCH_FLUSH_CACHE)
+# define POLYBENCH_NO_FLUSH_CACHE 1
 #endif
 
 
@@ -100,10 +117,22 @@ static
 unsigned long long int rdtsc()
 {
   unsigned long long int ret = 0;
+#if defined(__lvx__)
+  /* LVX's cycle counter is $frcc (SRS 63), a 64-bit free-running counter read
+     by the scalar `get'.  It is one register, so there is no hi/lo pair to
+     reassemble -- the x86 split below exists only because RDTSC returns the
+     count in EDX:EAX.  The `;;' terminates the VLIW bundle, and the "memory"
+     clobber keeps the read from being scheduled across the kernel it is
+     timing.  This is the same register lvx-newlib reads in __lvx_cycles()
+     (libgloss/lvx-mbr/counters.c), from which clock() and gettimeofday() are
+     derived, so a cycle count and a reported time cannot disagree.  */
+  __asm__ __volatile__ ("get %0 = $frcc\n\t;;" : "=r" (ret) : : "memory");
+#else
   unsigned int cycles_lo;
   unsigned int cycles_hi;
   __asm__ volatile ("RDTSC" : "=a" (cycles_lo), "=d" (cycles_hi));
   ret = (unsigned long long int)cycles_hi << 32 | cycles_lo;
+#endif
 
   return ret;
 }
@@ -401,7 +430,11 @@ void polybench_timer_print()
 # ifndef POLYBENCH_CYCLE_ACCURATE_TIMER
       printf ("%0.6f\n", polybench_t_end - polybench_t_start);
 # else
-      printf ("%Ld\n", polybench_c_end - polybench_c_start);
+      /* %Ld is a glibc extension.  newlib's printf does not parse it, and
+	 the conversion is simply dropped -- the line comes out empty, so the
+	 run looks like it produced no measurement at all.  */
+      printf ("%llu\n",
+	      (unsigned long long) (polybench_c_end - polybench_c_start));
 # endif
 #endif
 }
@@ -520,7 +553,15 @@ xmalloc(size_t alloc_sz)
   /* By default, post-pad the arrays. Safe behavior, but likely useless. */
   polybench_inter_array_padding_sz += POLYBENCH_INTER_ARRAY_PADDING_FACTOR;
   size_t padded_sz = alloc_sz + polybench_inter_array_padding_sz;
+#if defined(__lvx__)
+  /* newlib ships memalign and aligned_alloc, but not posix_memalign.  Same
+     contract for the only alignment PolyBench asks for: 4096 is a power of two
+     and a multiple of sizeof (void *).  */
+  int err = 0;
+  ret = memalign (4096, padded_sz);
+#else
   int err = posix_memalign (&ret, 4096, padded_sz);
+#endif
   if (! ret || err)
     {
       fprintf (stderr, "[PolyBench] posix_memalign: cannot allocate memory");
