@@ -103,7 +103,28 @@ esac
 # -std=gnu89 -fpermissive.  FP contraction is left at GCC's default ON: ffma is
 # the instruction worth measuring, and the reference absorbs the difference
 # (harness/dumpcmp.py).
-CFLAGS="-O$OPT -march=$ARCH -I$repo/utilities"
+# RESTRICT=1 adds -DPOLYBENCH_USE_RESTRICT, which makes PolyBench's own
+# POLYBENCH_nD macros emit `restrict' on every kernel array parameter (the
+# POLYBENCH_RESTRICT hook, polybench.h:69).  It is OFF by default so the default
+# series measures the code as shipped, and it is tracked as a SEPARATE series
+# rather than a flag folded into one, because it changes what is being measured:
+# with it the compiler is told the arrays do not alias, without it it must prove
+# it and cannot.
+#
+# It is sound here.  Every array comes from polybench_alloc_data ->
+# xmalloc -> memalign, one allocation each, so no two kernel parameters can
+# overlap -- which is exactly the promise `restrict' makes.  The correctness gate
+# still runs, so a kernel where it were unsound would show up as MISMATCH.
+#
+# And it is the single biggest effect measured on this target so far: gemm at
+# MINI/float goes 109,316 -> 25,315 kernel cycles, 4.3x, because the inner
+# `C[i][j] += alpha * A[i][k] * B[k][j]' loop stops being blocked by
+# "would need a runtime alias check" and vectorizes.  See GAPS.md.
+RESTRICT=${RESTRICT:-0}
+rflag=""; rtag=""
+if [ "$RESTRICT" != 0 ]; then rflag="-DPOLYBENCH_USE_RESTRICT"; rtag="-restrict"; fi
+
+CFLAGS="-O$OPT -march=$ARCH -I$repo/utilities $rflag ${EXTRA_CFLAGS:-}"
 LDFLAGS="-T lvx-sim.ld -L$LDSCRIPTS -lm"
 DEFS="-D${DATASET}_DATASET -D$tmacro"
 
@@ -118,7 +139,7 @@ refdir="$repo/reference-output/$(echo "$DATASET" | tr A-Z a-z)-$TYPE"
 [ -d "$refdir" ] || echo "note: no reference in $refdir -- run harness/make-reference.sh" >&2
 
 outdir="$repo/results"; mkdir -p "$outdir"
-tsv="$outdir/$ARCH-O$OPT-$(echo "$DATASET" | tr A-Z a-z)-$TYPE.tsv"
+tsv="$outdir/$ARCH-O$OPT-$(echo "$DATASET" | tr A-Z a-z)-$TYPE$rtag.tsv"
 work=$(mktemp -d); trap 'rm -rf "$work"' 0 1 2 3 15
 
 HEADER='kernel\tarch\topt\tdataset\ttype\tcorrect\tkernel_cycles\tprog_cycles\tbundles_dyn\ttext_bytes\tinsns_static\tbundles_static\tkernel_insns\tsimd_insns\tscalar_fma'

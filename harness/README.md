@@ -52,6 +52,29 @@ the measurement before the compiler.
 This is the one respect in which PolyBench is a better instrument here than
 `lvx-mibench`, which has only whole-program numbers.
 
+## Run the restrict series — it is the one that measures the compiler
+
+```bash
+RESTRICT=1 ./harness/run.sh          # writes results/<...>-restrict.tsv
+./harness/restrictcompare.sh         # what restrict bought, per kernel
+```
+
+`-DPOLYBENCH_USE_RESTRICT` is upstream's own hook (`polybench.h:69`) and is
+worth a **mean 2.15×** on lvx-2, up to 5.28×, because without it 20 of 30
+kernels are refused by the vectorizer with "would need a runtime alias check".
+Without it this suite largely measures an aliasing wall rather than LVX code
+generation — see `GAPS.md` §9.
+
+It is kept **off by default and tracked as a separate series**, not folded into
+one, because the two measure different things: with it the compiler is told the
+arrays cannot alias, without it it must prove that and cannot. The default
+series is PolyBench as shipped; the restrict series is the compiler.
+
+`EXTRA_CFLAGS` passes anything else through, for one-off probes
+(`EXTRA_CFLAGS=-fvect-cost-model=cheap`, which is a weaker version of the same
+unlock — it lets GCC pay for a runtime alias check instead of removing the need
+for one).
+
 ## Why cycles, not time
 
 The ISS is **deterministic**: the same ELF yields the same counts every run, on

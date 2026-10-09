@@ -27,6 +27,7 @@ newlib, gem5 or the compiler.
 | 6 | the dump goes to `stderr`, which gem5 shares | `stdout` on LVX | corrupted dump, unfilterable |
 | 7 | `jacobi-1d` computes its FP32 kernel in FP64 | `SCALAR_VAL` | a **21.7% phantom FP32 slowdown** |
 | 8 | `TYPE=int` builds 0 of 30 kernels | harness rejects it | 30 `buildfail` rows |
+| 9 | **aliasing blocks vectorization in 20 of 30 kernels** | `-DPOLYBENCH_USE_RESTRICT` | **2.15× left on the table** |
 
 Gaps 4, 5 and 6 are the dangerous ones. None produces an error message, and
 each looks like a broken port or a broken benchmark rather than a missing
@@ -198,6 +199,103 @@ nothing. What discriminates is **`fnarrow*` or an f64 arithmetic op**:
 therefore fails to compile with `-DDATA_TYPE_IS_INT` — measured, **0 of 30
 build**. The harness now rejects `TYPE=int` with that explanation rather than
 emitting 30 `buildfail` rows.
+
+## 9. Vectorization was blocked by aliasing, not by the vectorizer — 2.15x
+
+The biggest effect measured on this target so far, and it overturns the first
+conclusion drawn from this suite.
+
+PolyBench's kernels take their arrays as plain pointer parameters, so GCC cannot
+prove the output array does not overlap the inputs. The vectorizer says so
+exactly:
+
+```
+gemm.c:94:27: missed: versioning for alias required: can't determine
+              dependence between (*_37)[k_153] and (*_26)[j_152]
+gemm.c:93:22: missed: would need a runtime alias check
+gemm.c:93:22: missed: couldn't vectorize loop
+gemm.c:90:19: optimized: loop vectorized using 32 byte vectors, unroll 8
+```
+
+Read the last two lines together: the trivial `C[i][j] *= beta` loop at line 90
+vectorizes, and the multiply-accumulate at 93–94 that *is* the kernel does not.
+At `-O2` GCC's default cost model is `very-cheap`, which refuses any loop
+requiring a runtime alias check — so it declines to version and gives up.
+**Measured: 20 of 30 kernels are blocked this way.**
+
+### The fix is upstream's own flag
+
+`polybench.h:69` already has the hook — `POLYBENCH_RESTRICT`, which
+`-DPOLYBENCH_USE_RESTRICT` turns into `restrict` on every kernel array
+parameter. No source edits.
+
+| | gemm cycles | speedup | source edits | what it asserts |
+|---|---|---|---|---|
+| baseline `-O2` | 109,316 | 1.00× | — | — |
+| `#pragma GCC ivdep` | 32,513 | 3.36× | **155** inner loops | this loop's dependences |
+| `-fvect-cost-model=cheap` | 33,175 | 3.30× | none | policy, not facts |
+| `-O3` | 59,008 | 1.85× | none | ditto, plus other passes |
+| **`-DPOLYBENCH_USE_RESTRICT`** | **25,315** | **4.32×** | **none** | the whole function's aliasing |
+
+All four work. `restrict` wins because it gives the *alias oracle* a fact rather
+than relaxing a cost threshold, so it also improves addressing and scheduling,
+not only the one loop `ivdep` covers — and `ivdep` would need annotating 155
+loops across the suite. `-O3` is counterproductive, and `restrict -O3`
+(37,548) is **worse than `restrict -O2`**.
+
+### Suite-wide, lvx-2, `-O2`, MINI, float
+
+```
+30 kernels: mean 2.15x, best 2mm at 5.28x
+>=1.5x faster: 14     slower: 0     correctness regressions: 0
+```
+
+Six of the seven kernels that previously emitted **no SIMD at all** now
+vectorize: `heat-3d` 0→47 lane-wise instructions (4.51×), `fdtd-2d` 0→39
+(2.74×), `jacobi-2d` 0→35 (2.95×), `jacobi-1d` 0→20 (3.15×), `gesummv` 0→18
+(1.89×), `gramschmidt` 0→9 (1.36×). Only `floyd-warshall` still emits none.
+
+### And the gain really is SIMD
+
+The control settles it. `restrict` on **lvx-1**, which has no lane-wise
+arithmetic at all, gives only **1.17×** — that part is better scalar addressing.
+On lvx-2 it gives 2.15×. Comparing the two cores *with* restrict:
+
+| | mean lvx-2 / lvx-1 |
+|---|---|
+| without `restrict` | **1.00×** — lvx-2 bought nothing |
+| with `restrict` | **1.84×**, 13 kernels ≥1.3×, up to 4.81× (`heat-3d`) |
+
+So the vectorizer and the lvx-2 back end were working the whole time; aliasing
+was starving them. The earlier reading of this suite — "the vectorizer fires and
+gains nothing because the scalar FMA stays" — described the symptom. The scalar
+FMA stayed because the loop containing it was never vectorized.
+
+FP32 vs FP64 moves with it, from a mean of 1.01× to **1.14×**, with two kernels
+finally past 1.6× (`heat-3d` 3.25×, `2mm` 1.73×). Still short of the 2× that four
+f32 lanes against two f64 lanes should give, so there is a second-order question
+left — vector-width selection rather than whether vectorization happens.
+
+### Still at 1.00x with restrict, and this is the real remaining list
+
+`trmm`, `cholesky`, `durbin`, `lu`, `ludcmp`, `trisolv`, `seidel-2d`,
+`floyd-warshall`, `nussinov` — triangular solvers and dependence-carrying
+stencils, where the inner loop has a genuine loop-carried dependence or a
+triangular bound. Those are a real vectorizer/ISA question, unlike the 21 that
+only needed an aliasing fact.
+
+### How this is tracked
+
+`RESTRICT=1 ./harness/run.sh` writes a separate `*-restrict.tsv` series, and
+`harness/restrictcompare.sh` diffs the two. Kept as two series rather than one
+flag because they measure different things: with it the compiler is *told* the
+arrays do not alias, without it it must prove it and cannot.
+
+`restrict` is sound here, and checked rather than assumed: every array is its own
+`polybench_alloc_data` → `xmalloc` → `memalign` allocation, and no kernel
+receives the same `POLYBENCH_ARRAY` twice (verified across all 30 call sites).
+The correctness gate runs on the restrict series too — all 30 kernels keep their
+verdict class, no MISMATCH.
 
 ## What is *not* a gap
 

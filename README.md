@@ -64,60 +64,76 @@ scalar f32 and f64 cost the same. So the per-kernel float/double ratio is a
 direct read-out of how much the vectorizer achieved: **~2× means the lanes are
 filling, ~1× means the kernel is effectively scalar.**
 
-## The first result
+## The result: aliasing was the whole problem
 
-`results/lvx-{1,2}-O2-mini-{float,double}.tsv`, 2026-10-09, `-O2`, `MINI`,
-atomic CPU. All four sweeps: 22 kernels `ok`, 7 `fp-N`, 1 `fp-contract`, **no
-mismatches** — so every number below is a believable one.
+`-O2`, MINI, atomic CPU, both cores, both FP widths. 22 kernels `ok`, 7 `fp-N`,
+1 `fp-contract`, no mismatches in any series.
+
+**As shipped, PolyBench measures an aliasing wall rather than the compiler.**
+The kernels take their arrays as plain pointer parameters, so GCC cannot prove
+the output does not overlap the inputs, and at `-O2` its `very-cheap` cost model
+refuses to emit a runtime alias check. It therefore vectorizes the trivial
+`C[i][j] *= beta` loop and declines the multiply-accumulate beside it:
 
 ```
-30 kernels compared, mean float/double speedup 1.01x
->=1.6x (lanes filling): 0    <=1.15x (effectively scalar): 29
+gemm.c:93:22: missed: would need a runtime alias check
+gemm.c:90:19: optimized: loop vectorized using 32 byte vectors, unroll 8
 ```
 
-**Nothing in PolyBench is vectorized to any useful degree.** The best kernel is
-`durbin` at 1.22×, then `nussinov` 1.09× and `adi` 1.07×; the rest sit at
-1.00–1.02×, and `trisolv` at 0.99× is the only one below parity. Comparing the two cores says the
-same thing from the other side: on double, **not one kernel moves more than 2%**
-between lvx-1 and lvx-2, and on float only `durbin` (−11.1%) and `gemm` (−1.4%)
-do.
+20 of 30 kernels are blocked this way. `-DPOLYBENCH_USE_RESTRICT` — upstream's
+own hook at `polybench.h:69`, no source edits — removes it:
 
-### But it is not that the vectorizer never runs
-
-That is the finding the `simd_insns`/`scalar_fma` columns exist to make, and it
-is the opposite of what the cycle counts alone suggest:
-
-| | lvx-2, float, MINI |
+| lvx-2, `-O2`, MINI, float | |
 |---|---|
-| kernels emitting lane-wise SIMD | **23 of 30** |
-| of those, kernels where the scalar FMA count is **unchanged** | **21 of 23** |
-| of those, kernels gaining more than 2% | **1** (`durbin`) |
+| mean speedup from `restrict` | **2.15×** |
+| best | `2mm` **5.28×**, `heat-3d` 4.51×, `gemm` 4.32× |
+| kernels ≥1.5× faster | **14 of 30** |
+| kernels slower | **0** |
+| correctness regressions | **0** |
 
-The vectorizer fires on most of the suite and grows the kernel by 30–60%
-(`3mm` 289 → 470 instructions, `gemm` 195 → 298) — and the scalar
-multiply-accumulate it was supposed to replace is **still there**. The vector
-code is *additional*: it takes the easy elementwise loop and leaves the
-reduction nest that is the actual kernel alone. `gemm` is the clearest case —
-of its two loops only `C[i][j] *= beta` vectorizes, while the
-multiply-accumulate stays scalar `ffmaw`/`fmulw`.
+Six of the seven kernels that emitted *no* SIMD at all now vectorize —
+`heat-3d` 0→47 lane-wise instructions, `fdtd-2d` 0→39, `jacobi-2d` 0→35.
 
-So the gap is not "turn the vectorizer on". It is reduction and
-multiply-accumulate loop nests specifically, which is where
-`lvx-gcc-while-ult-plan` is already aimed — now measured across 30 kernels
-instead of one, with a per-kernel baseline to track against.
+**And the gain is genuinely SIMD, not better scalar code.** On lvx-1, which has
+no lane-wise arithmetic, `restrict` is worth only 1.17×. Comparing the cores:
 
-The seven kernels that emit no SIMD at all (`fdtd-2d`, `floyd-warshall`,
-`gesummv`, `gramschmidt`, `heat-3d`, `jacobi-1d`, `jacobi-2d`) are a separate,
-more basic list — identical code on both cores.
+| mean lvx-2 / lvx-1 | |
+|---|---|
+| without `restrict` | **1.00×** — lvx-2 bought nothing at all |
+| with `restrict` | **1.84×**, up to 4.81× (`heat-3d`) |
 
-`jacobi-1d` used to read 0.82× — FP32 *slower* than FP64 — and that was a bug
-in the benchmark, not a result: it wrote its stencil coefficient as a bare
-`0.33333`, which is a `double` in C, so the FP32 build widened to f64,
-multiplied, and narrowed back. Fixed to `SCALAR_VAL(0.33333)` (`GAPS.md` §7);
-10,311 against 10,312, and 2,241 cycles of its 12,552 had been conversions. It
-is the only kernel in the suite with a bare FP literal inside `#pragma scop`,
-and the printed output never changed, so only the cycle count could reveal it.
+So the vectorizer and the lvx-2 back end were working all along. An earlier
+version of this file concluded the opposite — that the vectorizer fired and
+gained nothing because the scalar FMA count never changed. That was the
+symptom: the FMA stayed scalar because the loop holding it was never vectorized.
 
-See `harness/README.md` for what bounds these numbers: `MINI` trip counts are
-small, and the atomic CPU charges one cycle per bundle rather than modelling
-memory. Neither affects the instruction-count evidence above.
+FP32/FP64 moves with it, mean 1.01× → **1.14×**, two kernels past 1.6×
+(`heat-3d` 3.25×, `2mm` 1.73×). Still short of the 2× that four f32 lanes
+against two f64 should give, so vector-width selection is the open second-order
+question.
+
+### The real remaining list
+
+Nine kernels stay at 1.00× even with `restrict`: `trmm`, `cholesky`, `durbin`,
+`lu`, `ludcmp`, `trisolv`, `seidel-2d`, `floyd-warshall`, `nussinov` —
+triangular solvers and dependence-carrying stencils, where the inner loop has a
+genuine loop-carried dependence or a triangular bound. Those are a real
+vectorizer question, unlike the 21 that only needed an aliasing fact.
+
+`GAPS.md` §9 has the full comparison, including why `restrict` beats
+`#pragma GCC ivdep` (which also works, 3.36× on `gemm`, but asserts less and
+would need annotating 155 loops) and why `-O3` is counterproductive.
+
+### Caveats that bound these numbers
+
+`MINI` trip counts are small, so vectorization overhead is a larger share than
+at scale, and the default atomic CPU charges one cycle per bundle rather than
+modelling memory — `LVX_CPU=minor` is the honest cycle count and has not been
+swept.
+
+`jacobi-1d` used to read 0.82× FP32-vs-FP64, and that was a bug in the
+benchmark: a bare `0.33333` is a `double` in C, so the FP32 build widened to
+f64, multiplied and narrowed back. Fixed to `SCALAR_VAL(0.33333)` (`GAPS.md`
+§7) — 2,241 of its 12,552 cycles had been conversions. It is the only kernel
+with a bare FP literal inside `#pragma scop`, and the printed output never
+changed, so only the cycle count could reveal it.
