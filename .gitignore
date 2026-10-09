@@ -1,0 +1,9 @@
+# gem5 writes its stats and config here when a kernel is run by hand; the
+# harness runs out of a scratch dir and leaves nothing behind.
+m5out/
+*.o
+*.elf
+
+# utilities/clean.pl and create_cpped_version.pl leave these.
+*.preopt.c
+*_cpped.c
