@@ -7,10 +7,16 @@
 #   STATIC_ONLY=1 ./harness/run.sh              # build + static metrics, no ISS
 #   ONLY='gemm syrk 2mm' ./harness/run.sh       # a subset
 #   LVX_CPU=minor ./harness/run.sh              # pipeline model, slow
+#   COMPILER=clang ./harness/run.sh             # lvx-llvm instead of lvx-gcc
 #   ./harness/compare.sh results/A.tsv results/B.tsv
 #
 # Writes one TSV row per kernel to results/<arch>-O<opt>-<dataset>-<type>.tsv
 # and a human summary to stdout.  Commit the results: the series is the point.
+#
+# COMPILER=clang writes results/<arch>-clang-O<opt>-... instead: the compiler is
+# part of the configuration name, never a column folded into one file, because a
+# GCC row and a clang row of the same kernel are two series, not two samples of
+# one.  GCC stays unmarked so the series that predates clang keeps its name.
 #
 # WHY THE HEADLINE NUMBER IS THE GUEST'S OWN, NOT gem5's
 #
@@ -175,7 +181,18 @@ ONLY=${ONLY:-}
 TIMEOUT=${TIMEOUT:-5400}
 
 TOOLS=${LVX_TOOLS:-$CSW/lvx-toolchain/bin}
-GCC=$TOOLS/lvx-mbr-gcc
+# The core is spelled -march by lvx-gcc and -mcpu by clang, so the flag is
+# chosen here with the compiler, never by a caller.  It mattered: until
+# lvx-llvm d7a03955 (2026-10-16) clang took -march=lvx-2 as an unused argument,
+# warned, and built for its default core -- lvx-1 code, timed as lvx-2.  -march
+# is an alias there now, but -mcpu is clang's own spelling and right on every
+# build.
+COMPILER=${COMPILER:-gcc}
+case "$COMPILER" in
+    gcc)   XCC=$TOOLS/lvx-mbr-gcc;   cpuflag="-march=$ARCH"; ctag="" ;;
+    clang) XCC=$TOOLS/lvx-mbr-clang; cpuflag="-mcpu=$ARCH";  ctag="-clang" ;;
+    *) echo "COMPILER must be gcc or clang (got $COMPILER)" >&2; exit 2 ;;
+esac
 OBJDUMP=$TOOLS/lvx-mbr-objdump
 SIZE=$TOOLS/lvx-mbr-size
 GEM5=${GEM5:-$CSW/lvx-gem5/build/gem5-lvx$core.opt}
@@ -199,7 +216,11 @@ esac
 # posix_memalign).  Unlike MiBench, these kernels are strict C99 and need no
 # -std=gnu89 -fpermissive.  FP contraction is left at GCC's default ON: ffma is
 # the instruction worth measuring, and the reference absorbs the difference
-# (harness/dumpcmp.py).
+# (harness/dumpcmp.py).  The two compilers' defaults differ -- GCC contracts
+# across statements (=fast), clang only within one expression (=on) -- and that
+# is left alone on purpose: a default is part of what a compiler is, so forcing
+# one would measure neither.  The fp-contract escalation below is
+# -ffp-contract=off on both, which is the same strict build either way.
 # RESTRICT=1 adds -DPOLYBENCH_USE_RESTRICT, which makes PolyBench's own
 # POLYBENCH_nD macros emit `restrict' on every kernel array parameter (the
 # POLYBENCH_RESTRICT hook, polybench.h:69).  It is OFF by default so the default
@@ -221,11 +242,11 @@ RESTRICT=${RESTRICT:-0}
 rflag=""; rtag=""
 if [ "$RESTRICT" != 0 ]; then rflag="-DPOLYBENCH_USE_RESTRICT"; rtag="-restrict"; fi
 
-CFLAGS="-O$OPT -march=$ARCH -I$repo/utilities $rflag ${EXTRA_CFLAGS:-}"
+CFLAGS="-O$OPT $cpuflag -I$repo/utilities $rflag ${EXTRA_CFLAGS:-}"
 LDFLAGS="-T lvx-sim.ld -L$LDSCRIPTS -lm"
 DEFS="-D${DATASET}_DATASET -D$tmacro"
 
-for t in "$GCC" "$OBJDUMP" "$SIZE"; do
+for t in "$XCC" "$OBJDUMP" "$SIZE"; do
     [ -x "$t" ] || { echo "missing tool: $t" >&2; exit 2; }
 done
 if [ "$STATIC_ONLY" != 1 ]; then
@@ -236,7 +257,7 @@ refdir="$repo/reference-output/$(echo "$DATASET" | tr A-Z a-z)-$TYPE"
 [ -d "$refdir" ] || echo "note: no reference in $refdir -- run harness/make-reference.sh" >&2
 
 outdir="$repo/results"; mkdir -p "$outdir"
-tsv="$outdir/$ARCH-O$OPT-$(echo "$DATASET" | tr A-Z a-z)-$TYPE$rtag.tsv"
+tsv="$outdir/$ARCH$ctag-O$OPT-$(echo "$DATASET" | tr A-Z a-z)-$TYPE$rtag.tsv"
 work=$(mktemp -d); trap 'rm -rf "$work"' 0 1 2 3 15
 
 HEADER='kernel\tarch\topt\tdataset\ttype\tcorrect\tkernel_cycles\tprog_cycles\tbundles_dyn\ttext_bytes\tinsns_static\tbundles_static\tkernel_insns\tsimd_insns\tscalar_fma'
@@ -264,7 +285,7 @@ while read -r path; do
             "${8:-}" "${9:-}" "${10:-}" >> "$rows"; }
 
     # --- the timed build: computation alive, print_array behind DCE_ONLY_CODE
-    if ! $GCC $CFLAGS -I"$repo/$dir" "$repo/utilities/polybench.c" "$repo/$path" \
+    if ! $XCC $CFLAGS -I"$repo/$dir" "$repo/utilities/polybench.c" "$repo/$path" \
          $DEFS -DPOLYBENCH_CYCLE_ACCURATE_TIMER $LDFLAGS -o "$bdir/t.elf" -lm \
          > "$bdir/build-t.log" 2>&1; then
         printf '%-16s %-10s %14s %14s %10s %8s %6s %6s\n' \
@@ -298,7 +319,7 @@ while read -r path; do
     # off an image that is mostly library code, so it is counted on the kernel
     # translation unit alone -- also the right scope, since
     # utilities/polybench.c is instrumentation rather than kernel.
-    $GCC $CFLAGS -I"$repo/$dir" $DEFS -DPOLYBENCH_CYCLE_ACCURATE_TIMER \
+    $XCC $CFLAGS -I"$repo/$dir" $DEFS -DPOLYBENCH_CYCLE_ACCURATE_TIMER \
          -c "$repo/$path" -o "$bdir/k.o" > /dev/null 2>&1
     $OBJDUMP -d "$bdir/k.o" > "$bdir/kdis.txt" 2>/dev/null
     kinsns=$(grep -cE '^\s+[0-9a-f]+:' "$bdir/kdis.txt")
@@ -312,7 +333,7 @@ while read -r path; do
     fi
 
     # --- the dumping build, for the correctness gate
-    $GCC $CFLAGS -I"$repo/$dir" "$repo/utilities/polybench.c" "$repo/$path" \
+    $XCC $CFLAGS -I"$repo/$dir" "$repo/utilities/polybench.c" "$repo/$path" \
          $DEFS -DPOLYBENCH_DUMP_ARRAYS $LDFLAGS -o "$bdir/d.elf" -lm \
          > "$bdir/build-d.log" 2>&1
 
@@ -380,7 +401,7 @@ while read -r path; do
                 # wrong encodings -- fails both ways, so this cannot launder
                 # one.  Only paid when the strict compare already failed.
                 reason=$correct
-                $GCC $CFLAGS -I"$repo/$dir" -ffp-contract=off \
+                $XCC $CFLAGS -I"$repo/$dir" -ffp-contract=off \
                      "$repo/utilities/polybench.c" "$repo/$path" \
                      $DEFS -DPOLYBENCH_DUMP_ARRAYS $LDFLAGS -o "$bdir/s.elf" -lm \
                      > "$bdir/build-s.log" 2>&1

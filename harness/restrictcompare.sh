@@ -21,9 +21,10 @@
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"; repo="$(dirname "$here")"
 ARCH=${ARCH:-lvx-2}; OPT=${OPT:-2}; DATASET=${DATASET:-MINI}; TYPE=${TYPE:-float}
+COMPILER=${COMPILER:-gcc}; ctag=; [ "$COMPILER" = clang ] && ctag=-clang
 ds=$(echo "$DATASET" | tr A-Z a-z)
-base=$repo/results/$ARCH-O$OPT-$ds-$TYPE.tsv
-rest=$repo/results/$ARCH-O$OPT-$ds-$TYPE-restrict.tsv
+base=$repo/results/$ARCH$ctag-O$OPT-$ds-$TYPE.tsv
+rest=$repo/results/$ARCH$ctag-O$OPT-$ds-$TYPE-restrict.tsv
 for f in "$base" "$rest"; do
     [ -f "$f" ] || { echo "missing $f -- run ./harness/run.sh and RESTRICT=1 ./harness/run.sh" >&2; exit 2; }
 done

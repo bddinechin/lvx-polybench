@@ -8,6 +8,7 @@ TYPE=float ./harness/run.sh                 # just one width
 STATIC_ONLY=1 ./harness/run.sh              # build + static metrics, minutes
 ONLY='gemm syrk 2mm' ./harness/run.sh       # a subset
 LVX_CPU=minor ./harness/run.sh              # pipeline model, much slower
+COMPILER=clang ./harness/run.sh             # lvx-llvm instead of lvx-gcc
 
 ./harness/make-reference.sh                 # regenerate the x86 oracle
 ./harness/fpcompare.sh                      # 32-bit vs 64-bit FP, side by side
@@ -16,6 +17,14 @@ LVX_CPU=minor ./harness/run.sh              # pipeline model, much slower
 
 Results land in `results/<arch>-O<opt>-<dataset>-<type>.tsv`, one row per kernel.
 Commit them: the series is the point, and `compare.sh` diffs two of them.
+
+`COMPILER=clang` builds with lvx-llvm instead of lvx-gcc and writes
+`results/<arch>-clang-O<opt>-…` — a separate series, never rows mixed into the
+GCC file. The harness picks the core flag with the compiler — `-mcpu` for
+clang, which before lvx-llvm `d7a03955` turned `-march=lvx-2` into a warning and
+an **lvx-1** build. Clang on lvx-2 only: the installed lvx-llvm holds `lvx_v2`,
+on which `-mcpu=lvx-1` is unsupported. `fpcompare.sh` and `restrictcompare.sh` take
+the same `COMPILER=`.
 
 ## Both FP widths, every time
 
