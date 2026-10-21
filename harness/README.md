@@ -22,7 +22,7 @@ Commit them: the series is the point, and `compare.sh` diffs two of them.
 `results/<arch>-clang-O<opt>-…` — a separate series, never rows mixed into the
 GCC file. The harness picks the core flag with the compiler — `-mcpu` for
 clang, which before lvx-llvm `d7a03955` turned `-march=lvx-2` into a warning and
-an **lvx-1** build. Clang on lvx-2 only: the installed lvx-llvm holds `lvx_v2`,
+an **lvx-1** build. Clang on lvx-2 only: the installed lvx-llvm holds `lvx_2`,
 on which `-mcpu=lvx-1` is unsupported. `fpcompare.sh` and `restrictcompare.sh` take
 the same `COMPILER=`.
 
