@@ -260,7 +260,36 @@ outdir="$repo/results"; mkdir -p "$outdir"
 tsv="$outdir/$ARCH$ctag-O$OPT-$(echo "$DATASET" | tr A-Z a-z)-$TYPE$rtag.tsv"
 work=$(mktemp -d); trap 'rm -rf "$work"' 0 1 2 3 15
 
+# lvx-perf's bin/lvx-rev-stamp owns the provenance columns, and is called
+# rather than copied -- this suite carries the Ohio State University licence,
+# lvx-perf is Apache-2.0 WITH LLVM-exception, and executing a script is not
+# deriving from it. A standalone checkout with no superproject records
+# `unknown' rather than failing.
+#
+# Per row, not per sweep: a toolchain reinstalled in place midway is the
+# hazard, and a once-per-sweep stamp cannot show it. A full dataset here is
+# 30 kernels, so a sweep spans long enough for that to happen.
+super=$(git -C "$repo" rev-parse --show-superproject-working-tree 2>/dev/null) || super=
+STAMP=
+[ -n "$super" ] && [ -x "$super/bin/lvx-rev-stamp" ] && STAMP="$super/bin/lvx-rev-stamp"
+stamp_cols=(csw_rev gcc_rev gem5_rev cc_mtime)
+stamp_header() {
+    if [ -n "$STAMP" ]; then "$STAMP" --tsv-header
+    else (IFS=$'\t'; printf '%s\n' "${stamp_cols[*]}"); fi
+}
+stamp_row() {
+    if [ -n "$STAMP" ]; then "$STAMP" --tsv-row ${CSW:+--csw "$CSW"}
+    else
+        local u=() c
+        for c in "${stamp_cols[@]}"; do u+=(unknown); done
+        (IFS=$'\t'; printf '%s\n' "${u[*]}")
+    fi
+}
+
 HEADER='kernel\tarch\topt\tdataset\ttype\tcorrect\tkernel_cycles\tprog_cycles\tbundles_dyn\ttext_bytes\tinsns_static\tbundles_static\tkernel_insns\tsimd_insns\tscalar_fma'
+HEADER="$HEADER\t$(stamp_header | sed 's/\t/\\t/g')"
+# The field count the carry-over below pads stale rows up to.
+want_fields=$(printf "$HEADER\n" | awk -F'\t' '{print NF}')
 
 # Rows are collected here and merged into $tsv at the end.  Writing $tsv
 # directly would make an ONLY= run DESTROY a full baseline, since the path
@@ -279,10 +308,10 @@ while read -r path; do
     [ -n "$ONLY" ] && ! grep -qw "$name" <<<"$ONLY" && continue
 
     bdir="$work/$name"; mkdir -p "$bdir"
-    row() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    row() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$name" "$ARCH" "$OPT" "$DATASET" "$TYPE" "$1" \
             "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" \
-            "${8:-}" "${9:-}" "${10:-}" >> "$rows"; }
+            "${8:-}" "${9:-}" "${10:-}" "$(stamp_row)" >> "$rows"; }
 
     # --- the timed build: computation alive, print_array behind DCE_ONLY_CODE
     if ! $XCC $CFLAGS -I"$repo/$dir" "$repo/utilities/polybench.c" "$repo/$path" \
@@ -442,8 +471,14 @@ if [ -f "$tsv" ]; then
     # file, with the stale row sorting first.  The merge exists to stop an
     # ONLY= re-run from destroying a baseline, which it did; it was silently
     # duplicating instead.  Found 2026-10-09 by an ONLY=gramschmidt re-run.
-    awk -F'\t' 'NR==FNR { seen[$1]=1; next }
-                 FNR>1 && !($1 in seen) { print }' "$rows" "$tsv" >> "$rows"
+    awk -F'\t' -v OFS='\t' -v want="$want_fields" '
+                 NR==FNR { seen[$1]=1; next }
+                 FNR>1 && !($1 in seen) {
+                   # A baseline row predating the provenance columns is
+                   # shorter than the header. Pad it, so an ONLY= re-run
+                   # cannot leave the merged file ragged.
+                   for (i = NF + 1; i <= want; i++) $i = ""
+                   print }' "$rows" "$tsv" >> "$rows"
 fi
 awk '/^[^#]/ && NF { sub(/^\.\//,""); n=$0; sub(/.*\//,"",n); sub(/\.c$/,"",n);
                      if (n!="") print n }' "$repo/utilities/benchmark_list" \
